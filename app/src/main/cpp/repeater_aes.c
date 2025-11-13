@@ -1,0 +1,735 @@
+#include "repeater_aes.h"
+
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <malloc.h>
+
+#include "RepeaterApp_log.h"
+//#include "common/crypto/aes_key_gen.h"
+
+#define AES_KEY_LOG_I(fmt, ...) REPEATERLOG_I("AES_KEY] [" fmt, ##__VA_ARGS__)
+#define AES_KEY_LOG_E(fmt, ...) REPEATERLOG_E("AES_KEY] [" fmt, ##__VA_ARGS__)
+#define AES_KEY_LOG_W(fmt, ...) REPEATERLOG_W("AES_KEY] [" fmt, ##__VA_ARGS__)
+// #define AES_KEY_LOG_D(fmt, ...) REPEATERLOG_D("AES_KEY] [" fmt, ##__VA_ARGS__)
+#define AES_KEY_LOG_D(fmt, ...)
+
+typedef struct repeater_aes_context {
+  uint8_t client_count;
+  pthread_mutex_t mutex;
+  uint8_t default_key[AES_KEY_SIZE];
+  Quadruples repeater_quadruples[MAX_AES_KEY_NUM];
+  Quadruples client_quadruples;
+  uint8_t master_mac[6];
+} RepeaterAesContext;
+
+// 声明来自 cpp 的函数
+extern void set_aes_key_iv(const unsigned char *key, const unsigned char *iv);
+
+static RepeaterAesContext ctx = {.mutex = PTHREAD_MUTEX_INITIALIZER};
+
+static const char *mat2str(const char *mac, char *buff, size_t buff_size) {
+  memset(buff, 0, buff_size);
+  if (!mac || !buff || buff_size < 18) {
+    AES_KEY_LOG_E("Invalid parameters for formatting MAC address");
+    return "NULL";
+  }
+  snprintf(buff, buff_size, "%02hhX:%02hhX:%02hhX:%02hhX:%02hhX:%02hhX", mac[0], mac[1], mac[2], mac[3], mac[4],
+           mac[5]);
+  AES_KEY_LOG_D("Formatted MAC address: %s", buff);
+  return buff;
+}
+
+static const char *mat2str_raw(const char *mac, char *buff, size_t buff_size) {
+  memset(buff, 0, buff_size);
+  if (!mac || !buff || buff_size < 18) {
+    AES_KEY_LOG_E("Invalid parameters for formatting MAC address");
+    return "NULL";
+  }
+  snprintf(buff, buff_size, "%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  AES_KEY_LOG_D("Formatted MAC address: %s", buff);
+  return buff;
+}
+
+const int str2mac(const char *mac_str, uint8_t *mac, size_t mac_size) {
+  if (!mac_str || !mac || mac_size < 6) {
+    AES_KEY_LOG_E("Invalid parameters for parsing MAC address");
+    return -1;
+  }
+
+  int ret = 0;
+  // 首先尝试带冒号的格式 (例如: B0:E9:FE:56:13:4D)
+  ret = sscanf(mac_str, "%hhX:%hhX:%hhX:%hhX:%hhX:%hhX", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+
+  // 如果带冒号的格式失败，尝试不带冒号的格式 (例如: B0E9FE56134D)
+  if (ret != 6) {
+    // 检查字符串长度是否为12个字符
+    if (strlen(mac_str) != 12) {
+      AES_KEY_LOG_E("Invalid MAC address string length: %s (expected 12 chars or XX:XX:XX:XX:XX:XX format)", mac_str);
+      return -1;
+    }
+
+    // 解析12个字符的MAC地址
+    ret = sscanf(mac_str, "%2hhX%2hhX%2hhX%2hhX%2hhX%2hhX", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+    if (ret != 6) {
+      AES_KEY_LOG_E("Failed to parse MAC address from string: %s", mac_str);
+      return -1;
+    }
+  }
+
+  char buff[18] = {0};
+  AES_KEY_LOG_D("Parsed MAC address: %s", mat2str(mac, buff, sizeof(buff)));
+  return 0;
+}
+
+static const char *ip2str(const struct in_addr *ip, char *buff, size_t buff_size) {
+  memset(buff, 0, buff_size);
+  if (buff_size < INET_ADDRSTRLEN) {
+    AES_KEY_LOG_E("Buffer size too small for IP address");
+    return "NULL";
+  }
+  if (inet_ntop(AF_INET, ip, buff, INET_ADDRSTRLEN) == NULL) {
+    AES_KEY_LOG_E("Invalid parameters for formatting IP address");
+    return "NULL";
+  }
+  AES_KEY_LOG_D("Formatted IP address: %s", buff);
+  return buff;
+}
+
+static const char *key2str(const char *key, char *buff, size_t buff_size) {
+  if (buff_size < AES_KEY_SIZE + 1) {
+    AES_KEY_LOG_E("Buffer size too small for AES key");
+    return "NULL";
+  }
+  memcpy(buff, key, AES_KEY_SIZE);
+  buff[AES_KEY_SIZE] = '\0';
+  AES_KEY_LOG_D("Formatted key: %s", buff);
+  return buff;
+}
+
+void repeater_set_master_mac(const uint8_t *mac) {
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(ctx.master_mac, mac, 6);
+  pthread_mutex_unlock(&ctx.mutex);
+}
+
+void repeater_get_master_mac(uint8_t *mac) {
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(mac, ctx.master_mac, 6);
+  pthread_mutex_unlock(&ctx.mutex);
+}
+
+int repeater_del_quadruples(const uint8_t *mac) {
+  if (!mac) {
+    AES_KEY_LOG_E("Invalid MAC address for deleting quadruples");
+    return -1;
+  }
+  pthread_mutex_lock(&ctx.mutex);
+  int found = 0;
+  for (int i = 0; i < ctx.client_count; i++) {
+    if (memcmp(ctx.repeater_quadruples[i].mac, mac, 6) == 0) {
+      found = 1;
+      // Shift remaining entries left
+      for (int j = i; j < ctx.client_count - 1; j++) {
+        ctx.repeater_quadruples[j] = ctx.repeater_quadruples[j + 1];
+      }
+      memset(&ctx.repeater_quadruples[ctx.client_count - 1], 0, sizeof(Quadruples));
+      ctx.client_count--;
+      char mac_str[18] = {0};
+      AES_KEY_LOG_I("Deleted quadruples for MAC:%s", mat2str(mac, mac_str, sizeof(mac_str)));
+      break;
+    }
+  }
+  pthread_mutex_unlock(&ctx.mutex);
+  if (!found) {
+    char mac_str[18] = {0};
+    AES_KEY_LOG_W("Quadruples not found for MAC:%s", mat2str(mac, mac_str, sizeof(mac_str)));
+    return -1;
+  }
+  return 0;
+}
+
+// 删除内机的所有四元组信息
+int repeater_del_all_quadruples(void) {
+    pthread_mutex_lock(&ctx.mutex);
+    ctx.client_count = 0;
+    memset(ctx.repeater_quadruples, 0, sizeof(ctx.repeater_quadruples));
+//  COMM_FileUnlink(REPEATER_QUADRUPLES_CONFIG_FILE);
+    pthread_mutex_unlock(&ctx.mutex);
+//  RepeaterApp_send_del_slave("FFFFFFFFFFFF");
+//  RepeaterApp_master_client_kcp_connect_state_sync(-1, 65535, "FFFFFFFFFFFF");
+    return 0;
+}
+
+// 从后台同步拓展器的MAC列表
+int repeater_sync_quadruples(char **mac, int mac_count) {
+  if (mac == NULL || mac_count <= 0) {
+    AES_KEY_LOG_E("Invalid parameters for updating quadruples");
+    return -1;
+  }
+
+  /* 1、将传入的 mac 字符串全部转换为二进制形式，方便后续比较 */
+  uint8_t parsed_macs[MAX_AES_KEY_NUM][6] = {0};
+  int valid_mac_cnt = 0;
+  int need_save_file = 0;
+  for (int i = 0; i < mac_count && i < MAX_AES_KEY_NUM; i++) {
+    if (str2mac(mac[i], parsed_macs[valid_mac_cnt], sizeof(parsed_macs[valid_mac_cnt])) == 0) {
+      AES_KEY_LOG_I("[SYNC] 111 Server Return Extender MAC: %s", mac[i]);
+      valid_mac_cnt++;
+    }
+  }
+
+  pthread_mutex_lock(&ctx.mutex);
+
+  /* 2、删除 ctx.repeater_quadruples 中那些在 mac 数组里不存在的条目 */
+  int idx = 0;
+  while (idx < ctx.client_count) {
+    int found = 0;
+    for (int j = 0; j < valid_mac_cnt; j++) {
+      if (memcmp(ctx.repeater_quadruples[idx].mac, parsed_macs[j], 6) == 0) {
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      char mac_str[18] = {0};
+      AES_KEY_LOG_I("[UPDATE] Remove MAC: %s",
+                    mat2str_raw((const char *)ctx.repeater_quadruples[idx].mac, mac_str, sizeof(mac_str)));
+//      RepeaterApp_send_del_slave(mac_str);
+      uint16_t slave_id = (ctx.repeater_quadruples[idx].mac[4] << 8) | ctx.repeater_quadruples[idx].mac[5];
+//      RepeaterApp_master_client_kcp_connect_state_sync(-1, slave_id, mac_str);
+      for (int k = idx; k < ctx.client_count - 1; k++) {
+        ctx.repeater_quadruples[k] = ctx.repeater_quadruples[k + 1];
+      }
+      memset(&ctx.repeater_quadruples[ctx.client_count - 1], 0, sizeof(Quadruples));
+      ctx.client_count--;
+      if (!need_save_file) need_save_file = 1;
+      continue;
+    }
+    idx++;
+  }
+
+  /* 3、保存文件 */
+  if (need_save_file) {
+    repeater_save_quadruples();
+  }
+
+  pthread_mutex_unlock(&ctx.mutex);
+
+  return 0;
+}
+
+int repeater_dump_quadruples(void) {
+  pthread_mutex_lock(&ctx.mutex);
+  for (int i = 0; i < ctx.client_count; i++) {
+    AES_KEY_LOG_I("[DUMP] quadruples[%d]: MAC[%hhX:%hhX:%hhX:%hhX:%hhX:%hhX]", i, ctx.repeater_quadruples[i].mac[0],
+                  ctx.repeater_quadruples[i].mac[1], ctx.repeater_quadruples[i].mac[2],
+                  ctx.repeater_quadruples[i].mac[3], ctx.repeater_quadruples[i].mac[4],
+                  ctx.repeater_quadruples[i].mac[5]);
+  }
+  pthread_mutex_unlock(&ctx.mutex);
+  return 0;
+}
+
+void repeater_get_client_list(PClientList list) {
+  if (!list) {
+    AES_KEY_LOG_E("Invalid ClientList pointer");
+    return;
+  }
+  pthread_mutex_lock(&ctx.mutex);
+  list->count = ctx.client_count;
+  for (int i = 0; i < ctx.client_count; i++) {
+    memcpy(list->macs[i], ctx.repeater_quadruples[i].mac, 6);
+  }
+  pthread_mutex_unlock(&ctx.mutex);
+}
+
+void repeater_set_default_key(const uint8_t *key) {
+  if (!key) {
+    AES_KEY_LOG_E("Invalid default key");
+    return;
+  }
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(ctx.default_key, key, AES_KEY_SIZE);
+  pthread_mutex_unlock(&ctx.mutex);
+  char buff[64] = {0};
+  AES_KEY_LOG_I("Set default key: %s", key2str((const char *)ctx.default_key, buff, sizeof(buff)));
+}
+
+void repeater_get_default_key(uint8_t *key) {
+  if (!key) {
+    AES_KEY_LOG_E("Invalid buffer for getting default key");
+    return;
+  }
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(key, ctx.default_key, AES_KEY_SIZE);
+  pthread_mutex_unlock(&ctx.mutex);
+}
+
+Quadruples *repeater_get_quadruples(const uint8_t *mac) {
+  if (!mac) {
+    AES_KEY_LOG_E("Invalid MAC address for getting quadruples");
+    return NULL;
+  }
+  pthread_mutex_lock(&ctx.mutex);
+  for (int i = 0; i < ctx.client_count; i++) {
+    if (memcmp(ctx.repeater_quadruples[i].mac, mac, sizeof(ctx.repeater_quadruples[i].mac)) == 0) {
+      pthread_mutex_unlock(&ctx.mutex);
+      return &ctx.repeater_quadruples[i];
+    }
+  }
+  pthread_mutex_unlock(&ctx.mutex);
+  char mac_str[18] = {0};
+  AES_KEY_LOG_W("Quadruples not found for MAC[%s]", mat2str(mac, mac_str, sizeof(mac_str)));
+  return NULL;
+}
+
+static aes_128_cbc_encrypo_t *_repeater_aes_enc_get(PQuadruples quadruples) {
+  if (!quadruples) {
+    AES_KEY_LOG_E("Invalid quadruples for getting AES encrypter");
+    return NULL;
+  }
+
+  aes_128_cbc_encrypo_t *enc = calloc(1, sizeof(aes_128_cbc_encrypo_t));
+  if (!enc) {
+    AES_KEY_LOG_E("Failed to allocate memory for AES encrypter");
+    return NULL;
+  }
+
+  AES_KEY_LOG_I("[ENC] quadruples->key: %.*s", AES_KEY_SIZE, quadruples->key);
+  AES_KEY_LOG_I("[ENC] quadruples->iv: %.*s", AES_KEY_SIZE, quadruples->iv);
+
+    // ✅ 把 key/iv 传回 cpp 层保存
+    set_aes_key_iv((const unsigned char*)quadruples->key, (const unsigned char*)quadruples->iv);
+
+  if (aes_encrypo_opt(enc, quadruples->key, quadruples->iv, AES_OPT_TYPE_ENC_INIT)) {
+    AES_KEY_LOG_E("Failed to initialize AES encrypter with key and IV");
+    free(enc);
+    return NULL;
+  }
+  return enc;
+}
+
+static aes_128_cbc_decrypo_t *_repeater_aes_dec_get(PQuadruples quadruples) {
+  if (!quadruples) {
+    AES_KEY_LOG_E("Invalid quadruples for getting AES decrypter");
+    return NULL;
+  }
+
+  aes_128_cbc_decrypo_t *dec = calloc(1, sizeof(aes_128_cbc_decrypo_t));
+  if (!dec) {
+    AES_KEY_LOG_E("Failed to allocate memory for AES decrypter");
+    return NULL;
+  }
+
+  AES_KEY_LOG_I("[DEC] quadruples->key: %.*s", AES_KEY_SIZE, quadruples->key);
+  AES_KEY_LOG_I("[DEC] quadruples->iv: %.*s", AES_KEY_SIZE, quadruples->iv);
+
+  if (aes_decrypo_opt(dec, quadruples->key, quadruples->iv, AES_OPT_TYPE_DEC_INIT)) {
+    AES_KEY_LOG_E("Failed to initialize AES decrypter with key and IV");
+    free(dec);
+    return NULL;
+  }
+  return dec;
+}
+
+aes_128_cbc_encrypo_t *repeater_aes_enc_get(const uint8_t *mac) {
+  if (!mac) {
+    AES_KEY_LOG_E("Invalid MAC address for getting AES encrypter");
+    return NULL;
+  }
+
+  Quadruples *quadruples = repeater_get_quadruples(mac);
+  if (!quadruples) {
+    AES_KEY_LOG_W("Quadruples not found for MAC:%.*s", 6, mac);
+    return NULL;
+  }
+  return _repeater_aes_enc_get(quadruples);
+}
+
+aes_128_cbc_decrypo_t *repeater_aes_dec_get(const uint8_t *mac) {
+  if (!mac) {
+    AES_KEY_LOG_E("Invalid MAC address for getting AES decrypter");
+    return NULL;
+  }
+
+  Quadruples *quadruples = repeater_get_quadruples(mac);
+  if (!quadruples) {
+    AES_KEY_LOG_W("Quadruples not found for MAC:%.*s", 6, mac);
+    return NULL;
+  }
+  return _repeater_aes_dec_get(quadruples);
+}
+
+aes_128_cbc_encrypo_t *repeater_client_aes_enc_get(void) {
+  pthread_mutex_lock(&ctx.mutex);
+  aes_128_cbc_encrypo_t *enc = _repeater_aes_enc_get(&(ctx.client_quadruples));
+  pthread_mutex_unlock(&ctx.mutex);
+  return enc;
+}
+aes_128_cbc_decrypo_t *repeater_client_aes_dec_get(void) {
+  pthread_mutex_lock(&ctx.mutex);
+  aes_128_cbc_decrypo_t *dec = _repeater_aes_dec_get(&(ctx.client_quadruples));
+  pthread_mutex_unlock(&ctx.mutex);
+  return dec;
+}
+
+void repeater_aes_enc_deinit(aes_128_cbc_encrypo_t *enc) {
+  if (enc) {
+    aes_encrypo_opt(enc, NULL, NULL, AES_OPT_TYPE_ENC_DEINIT);
+    free(enc);
+  } else {
+    AES_KEY_LOG_E("Attempted to deinitialize a NULL AES encrypter");
+  }
+}
+
+void repeater_aes_dec_deinit(aes_128_cbc_decrypo_t *dec) {
+  if (dec) {
+    aes_decrypo_opt(dec, NULL, NULL, AES_OPT_TYPE_DEC_DEINIT);
+    free(dec);
+  } else {
+    AES_KEY_LOG_E("Attempted to deinitialize a NULL AES decrypter");
+  }
+}
+
+int repeater_add_quadruples(PQuadruples quadruples) {
+  if (!quadruples) {
+    AES_KEY_LOG_E("Invalid quadruples for adding");
+    return -1;
+  }
+
+  pthread_mutex_lock(&ctx.mutex);
+  if (ctx.client_count >= MAX_AES_KEY_NUM) {
+    AES_KEY_LOG_E("Maximum client count reached: %d", MAX_AES_KEY_NUM);
+    pthread_mutex_unlock(&ctx.mutex);
+    return -1;
+  }
+
+  Quadruples *quad = &(ctx.repeater_quadruples[ctx.client_count++]);
+  memcpy(quad, quadruples, sizeof(Quadruples));
+  pthread_mutex_unlock(&ctx.mutex);
+  char mac_buff[18] = {0};
+  AES_KEY_LOG_I("Added quadruple %d: MAC[%s]", ctx.client_count - 1, mat2str(quad->mac, mac_buff, sizeof(mac_buff)));
+  return 0;
+}
+
+int repeater_update_quadruples(PQuadruples quadruples) {
+  if (!quadruples) {
+    AES_KEY_LOG_E("Invalid quadruples for updating");
+    return -1;
+  }
+
+  pthread_mutex_lock(&ctx.mutex);
+  for (int i = 0; i < ctx.client_count; i++) {
+    if (memcmp(ctx.repeater_quadruples[i].mac, quadruples->mac, sizeof(ctx.repeater_quadruples[i].mac)) == 0) {
+      if (quadruples->ip.s_addr != 0) {
+        ctx.repeater_quadruples[i].ip = quadruples->ip;
+      }
+      if (quadruples->key[0] != 0) {
+        memcpy(ctx.repeater_quadruples[i].key, quadruples->key, sizeof(ctx.repeater_quadruples[i].key));
+      }
+      if (quadruples->iv[0] != 0) {
+        memcpy(ctx.repeater_quadruples[i].iv, quadruples->iv, sizeof(ctx.repeater_quadruples[i].iv));
+      }
+      pthread_mutex_unlock(&ctx.mutex);
+      char buff[18] = {0};
+      AES_KEY_LOG_I("Updated quadruple for client %d: MAC[%s]", i,
+                    mat2str(ctx.repeater_quadruples[i].mac, buff, sizeof(buff)));
+      AES_KEY_LOG_D("IP[%s]", ip2str(&ctx.repeater_quadruples[i].ip, buff, sizeof(buff)));
+      AES_KEY_LOG_D("KEY[%.*s]", AES_KEY_SIZE, ctx.repeater_quadruples[i].key);
+      AES_KEY_LOG_D("IV[%.*s]", AES_KEY_SIZE, ctx.repeater_quadruples[i].iv);
+      return 0;
+    }
+  }
+  pthread_mutex_unlock(&ctx.mutex);
+  repeater_add_quadruples(quadruples);
+  return -1;
+}
+
+void repeater_init_client_quadruples(PQuadruples quadruples) {
+  if (!quadruples) {
+    AES_KEY_LOG_E("Invalid quadruples for initializing client");
+    return;
+  }
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(&ctx.client_quadruples, quadruples, sizeof(Quadruples));
+  pthread_mutex_unlock(&ctx.mutex);
+    AES_KEY_LOG_E("repeater_init_client_quadruples quadruples for initializing client success");
+
+    char buff[18] = {0};
+    AES_KEY_LOG_I("Initialized client quadruples: IP[%s]", ip2str(&ctx.client_quadruples.ip, buff, sizeof(buff)));
+    AES_KEY_LOG_I("Initialized client quadruples: MAC[%s]", mat2str(ctx.client_quadruples.mac, buff, sizeof(buff)));
+}
+
+void repeater_client_get_aes_key(uint8_t *key) {
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(key, ctx.client_quadruples.key, sizeof(ctx.client_quadruples.key));
+  pthread_mutex_unlock(&ctx.mutex);
+}
+void repeater_client_get_aes_iv(uint8_t *iv) {
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(iv, ctx.client_quadruples.iv, sizeof(ctx.client_quadruples.iv));
+  pthread_mutex_unlock(&ctx.mutex);
+}
+void repeater_client_get_mac(uint8_t *mac) {
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(mac, ctx.client_quadruples.mac, sizeof(ctx.client_quadruples.mac));
+  pthread_mutex_unlock(&ctx.mutex);
+}
+void repeater_client_get_ip(struct in_addr *ip) {
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(ip, &ctx.client_quadruples.ip, sizeof(ctx.client_quadruples.ip));
+  pthread_mutex_unlock(&ctx.mutex);
+}
+void repeater_client_set_ip(const struct in_addr *ip) {
+  pthread_mutex_lock(&ctx.mutex);
+  memcpy(&ctx.client_quadruples.ip, ip, sizeof(ctx.client_quadruples.ip));
+  pthread_mutex_unlock(&ctx.mutex);
+//  RepeaterApp_notify_hub_ip_change(1);
+}
+
+// 基于repeaterId获取完整MAC地址
+int repeater_get_mac_by_repeater_id(uint16_t repeater_id, uint8_t *mac) {
+  if (!mac) {
+    AES_KEY_LOG_E("Invalid MAC buffer for getting MAC by repeater ID");
+    return -1;
+  }
+
+  pthread_mutex_lock(&ctx.mutex);
+
+  // 遍历所有四元组，查找匹配的repeaterId
+  for (int i = 0; i < ctx.client_count; i++) {
+    // 从MAC地址的后两字节提取repeaterId
+    uint16_t mac_low16 = (ctx.repeater_quadruples[i].mac[4] << 8) | ctx.repeater_quadruples[i].mac[5];
+
+    if (mac_low16 == repeater_id) {
+      // 找到匹配的MAC地址
+      memcpy(mac, ctx.repeater_quadruples[i].mac, 6);
+      pthread_mutex_unlock(&ctx.mutex);
+
+      char mac_str[18] = {0};
+      AES_KEY_LOG_D("Found MAC[%s] for repeaterId[%d(0x%04X)]", mat2str(mac, mac_str, sizeof(mac_str)), repeater_id,
+                    repeater_id);
+      return 0;
+    }
+  }
+
+  pthread_mutex_unlock(&ctx.mutex);
+
+  AES_KEY_LOG_W("No MAC address found for repeaterId[%d(0x%04X)]", repeater_id, repeater_id);
+  return -1;
+}
+
+void dump_quadruples(const char *tag, PQuadruples quadruples) {
+  char buff[18] = {0};
+  AES_KEY_LOG_I("%s: IP[%s]", tag, ip2str(&quadruples->ip, buff, INET_ADDRSTRLEN));
+  AES_KEY_LOG_I("%s: MAC[%s]", tag, mat2str(quadruples->mac, buff, sizeof(buff)));
+  AES_KEY_LOG_I("%s: KEY[%.*s]", tag, AES_KEY_SIZE, quadruples->key);
+  AES_KEY_LOG_I("%s: IV[%.*s]", tag, AES_KEY_SIZE, quadruples->iv);
+}
+
+static void repeater_check_config_dir(void) {
+    struct stat st = {0};
+//  if (stat(REPEATER_CONFIG_DIR, &st) == -1) {
+//    if (mkdir(REPEATER_CONFIG_DIR, 0755) == -1) {
+//      AES_KEY_LOG_E("Failed to create repeater config directory: %s", REPEATER_CONFIG_DIR);
+//    } else {
+//      AES_KEY_LOG_D("Created repeater config directory: %s", REPEATER_CONFIG_DIR);
+//    }
+//  }
+}
+
+void repeater_save_quadruples(void) {
+    repeater_check_config_dir();
+//  cJSON *json = cJSON_CreateArray();
+//  if (!json) {
+//    AES_KEY_LOG_E("Failed to create JSON array for quadruples");
+//    return;
+//  }
+//  char tmp[64] = {0};
+//  for (int i = 0; i < ctx.client_count; i++) {
+//    if (!ctx.repeater_quadruples[i].iv[0]) {
+//      AES_KEY_LOG_W("Invalid IV for client %d: MAC[%s]", i,
+//                    mat2str((const char *)ctx.repeater_quadruples[i].mac, tmp, sizeof(tmp)));
+//      continue;
+//    }
+//    cJSON *item = cJSON_CreateObject();
+//    if (!item) {
+//      AES_KEY_LOG_E("Failed to create JSON object for quadruple[%d]", i);
+//      cJSON_Delete(json);
+//      return;
+//    }
+//    cJSON_AddStringToObject(item, "mac", mat2str((const char *)ctx.repeater_quadruples[i].mac, tmp, sizeof(tmp)));
+//    cJSON_AddStringToObject(item, "key", key2str((const char *)ctx.repeater_quadruples[i].key, tmp, sizeof(tmp)));
+//    cJSON_AddStringToObject(item, "iv", key2str((const char *)ctx.repeater_quadruples[i].iv, tmp, sizeof(tmp)));
+//    cJSON_AddItemToArray(json, item);
+//  }
+//  // 将JSON数组保存到文件
+//  FILE *file = fopen(REPEATER_QUADRUPLES_CONFIG_FILE, "w");
+//  if (!file) {
+//    AES_KEY_LOG_E("Failed to open file for saving quadruples");
+//    cJSON_Delete(json);
+//    return;
+//  }
+//  char *json_string = cJSON_Print(json);
+//  if (!json_string) {
+//    AES_KEY_LOG_E("Failed to print JSON string for quadruples");
+//    fclose(file);
+//    cJSON_Delete(json);
+//    return;
+//  }
+//  fprintf(file, "%s\n", json_string);
+//  AES_KEY_LOG_I("%s", json_string);
+//  fclose(file);
+//  cJSON_Delete(json);
+//  free(json_string);
+}
+
+void repeater_load_quadruples(void) {
+    AES_KEY_LOG_D("dot");
+//  FILE *file = fopen(REPEATER_QUADRUPLES_CONFIG_FILE, "r");
+//  if (!file) {
+//    AES_KEY_LOG_E("Failed to open file for loading quadruples: %s", REPEATER_QUADRUPLES_CONFIG_FILE);
+//    return;
+//  }
+//  char buffer[1024];
+//  size_t bytesRead = fread(buffer, 1, sizeof(buffer) - 1, file);
+//  buffer[bytesRead] = '\0';  // 确保字符串以null
+//  fclose(file);
+//  cJSON *json = cJSON_Parse(buffer);
+//  if (!json) {
+//    AES_KEY_LOG_E("Failed to parse JSON from file: %s", cJSON_GetErrorPtr());
+//    return;
+//  }
+//
+//  if (!cJSON_IsArray(json)) {
+//    AES_KEY_LOG_E("JSON root is not an array");
+//    cJSON_Delete(json);
+//    return;
+//  }
+//  int count = cJSON_GetArraySize(json);
+//  if (count > MAX_AES_KEY_NUM) {
+//    AES_KEY_LOG_E("Too many quadruples in JSON, max allowed: %d", MAX_AES_KEY_NUM);
+//    cJSON_Delete(json);
+//    return;
+//  }
+//  pthread_mutex_lock(&ctx.mutex);
+//  ctx.client_count = count;
+//  for (int i = 0; i < count; i++) {
+//    cJSON *item = cJSON_GetArrayItem(json, i);
+//    if (!cJSON_IsObject(item)) {
+//      AES_KEY_LOG_E("JSON item %d is not an object", i);
+//      continue;
+//    }
+//    Quadruples *quad = &(ctx.repeater_quadruples[i]);
+//    cJSON *mac = cJSON_GetObjectItem(item, "mac");
+//    cJSON *key = cJSON_GetObjectItem(item, "key");
+//    cJSON *iv = cJSON_GetObjectItem(item, "iv");
+//    if (cJSON_IsString(mac) && cJSON_IsString(key) && cJSON_IsString(iv)) {
+//      if (strlen(key->valuestring) == AES_KEY_SIZE && strlen(iv->valuestring) == AES_KEY_SIZE) {
+//        str2mac(mac->valuestring, quad->mac, sizeof(quad->mac));
+//        memcpy(quad->key, key->valuestring, AES_KEY_SIZE);
+//        memcpy(quad->iv, iv->valuestring, AES_KEY_SIZE);
+//      }
+//    }
+//  }
+//  pthread_mutex_unlock(&ctx.mutex);
+//  cJSON_Delete(json);
+//
+//  if (ctx.client_count == 0) {
+//    AES_KEY_LOG_W("No valid quadruples loaded from file");
+//  } else {
+//    AES_KEY_LOG_I("Loaded %d quadruples from file", ctx.client_count);
+//    for (int i = 0; i < ctx.client_count; i++) {
+//      char tag[64];
+//      snprintf(tag, sizeof(tag), "Quadruple[%d]", i);
+//      dump_quadruples(tag, &(ctx.repeater_quadruples[i]));
+//    }
+//  }
+}
+
+void repeater_save_client_quadruples(void) {
+//  repeater_check_config_dir();
+//  cJSON *json = cJSON_CreateObject();
+//  if (!json) {
+//    AES_KEY_LOG_E("Failed to create JSON object for client quadruples");
+//    return;
+//  }
+//  char tmp[64] = {0};
+//  cJSON_AddStringToObject(json, "ip", ip2str(&ctx.client_quadruples.ip, tmp, sizeof(tmp)));
+//  cJSON_AddStringToObject(json, "mac", mat2str((const char *)ctx.client_quadruples.mac, tmp, sizeof(tmp)));
+//  cJSON_AddStringToObject(json, "key", key2str((const char *)ctx.client_quadruples.key, tmp, sizeof(tmp)));
+//  cJSON_AddStringToObject(json, "iv", key2str((const char *)ctx.client_quadruples.iv, tmp, sizeof(tmp)));
+//  cJSON_AddStringToObject(json, "master", mat2str((const char *)ctx.master_mac, tmp, sizeof(tmp)));
+//
+//  // 将JSON对象保存到文件
+//  FILE *file = fopen(REPEATER_CLIENT_CONFIG_FILE, "w");
+//  if (!file) {
+//    AES_KEY_LOG_E("Failed to open file for saving client quadruples");
+//    cJSON_Delete(json);
+//    return;
+//  }
+//  char *json_string = cJSON_Print(json);
+//  if (!json_string) {
+//    AES_KEY_LOG_E("Failed to print JSON string for client quadruples");
+//    fclose(file);
+//    cJSON_Delete(json);
+//    return;
+//  }
+//  fprintf(file, "%s\n", json_string);
+//  AES_KEY_LOG_I("%s", json_string);
+//  fclose(file);
+//  cJSON_Delete(json);
+//  free(json_string);
+}
+void repeater_load_client_quadruples(void) {
+//  AES_KEY_LOG_D("dot");
+//  FILE *file = fopen(REPEATER_CLIENT_CONFIG_FILE, "r");
+//  if (!file) {
+//    AES_KEY_LOG_E("Failed to open file for loading client quadruples: %s", REPEATER_CLIENT_CONFIG_FILE);
+//    return;
+//  }
+//  char buffer[1024];
+//  size_t bytesRead = fread(buffer, 1, sizeof(buffer) - 1, file);
+//  buffer[bytesRead] = '\0';  // 确保字符串以null
+//  fclose(file);
+//  cJSON *json = cJSON_Parse(buffer);
+//  if (!json) {
+//    AES_KEY_LOG_E("Failed to parse JSON from file: %s", cJSON_GetErrorPtr());
+//    return;
+//  }
+//  if (!cJSON_IsObject(json)) {
+//    AES_KEY_LOG_E("JSON root is not an object");
+//    cJSON_Delete(json);
+//    return;
+//  }
+//  cJSON *ip = cJSON_GetObjectItem(json, "ip");
+//  cJSON *mac = cJSON_GetObjectItem(json, "mac");
+//  cJSON *key = cJSON_GetObjectItem(json, "key");
+//  cJSON *iv = cJSON_GetObjectItem(json, "iv");
+//  cJSON *master = cJSON_GetObjectItem(json, "master");
+//  if (cJSON_IsString(ip) && cJSON_IsString(mac) && cJSON_IsString(key) && cJSON_IsString(iv) &&
+//      cJSON_IsString(master)) {
+//    if (strlen(key->valuestring) == AES_KEY_SIZE && strlen(iv->valuestring) == AES_KEY_SIZE) {
+//      ctx.client_quadruples.ip.s_addr = inet_addr(ip->valuestring);
+//      str2mac(mac->valuestring, ctx.client_quadruples.mac, sizeof(ctx.client_quadruples.mac));
+//      str2mac(master->valuestring, ctx.master_mac, sizeof(ctx.master_mac));
+//      memcpy(ctx.client_quadruples.key, key->valuestring, sizeof(ctx.client_quadruples.key));
+//      memcpy(ctx.client_quadruples.iv, iv->valuestring, sizeof(ctx.client_quadruples.iv));
+//
+//      dump_quadruples("client quadruples", &ctx.client_quadruples);
+//    }
+//  }
+}
+//int aes_generate_iv_string(char *iv, size_t iv_len) {
+//    // 生成随机IV
+//    char iv_temp[17];
+//    if (aes_generate_key_128_string(iv_temp, sizeof(iv_temp)) != 0) {
+//        AES_LOG_E("Failed to generate AES IV string");
+//        return -1;
+//    }
+//    memcpy(iv, iv_temp, iv_len);
+//    return 0;
+//}

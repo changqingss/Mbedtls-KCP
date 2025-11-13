@@ -1,0 +1,83 @@
+#ifndef __MSG_COMMON_H__
+#define __MSG_COMMON_H__
+
+// 按键ID
+typedef enum {
+  UART_MSG_BUTTON_ID1 = 0x1,
+  UART_MSG_BUTTON_ID2 = 0x2,
+  UART_MSG_BUTTON_ID3 = 0x3,
+  UART_MSG_BUTTON_ID4 = 0x4,
+  UART_MSG_BUTTON_ID5 = 0x5,
+  UART_MSG_BUTTON_ID6 = 0x6,
+  UART_MSG_BUTTON_ID7 = 0x7,
+} UART_MSG_BUTTON_ID;
+
+// 按键事件
+typedef enum {
+  UART_MSG_BUTTON_KEY_EVENT_DOWN = 0x1,
+  UART_MSG_BUTTON_KEY_EVENT_UP = 0x2,
+  UART_MSG_BUTTON_KEY_EVENT_RESP = 0x3,
+} UART_MSG_BUTTON_KEY_EVENT;
+
+// 内机控锁
+typedef enum {
+  HUB_LOCK_EVENT_LOCK,    // 上锁
+  HUB_LOCK_EVENT_UNLOCK,  // 解锁
+} HUB_LOCK_EVENT;
+
+// 内机的锁状态
+typedef enum {
+  HUB_LOCK_STATE_LOCKED,         // 已上锁
+  HUB_LOCK_STATE_LOCK_FAILED,    // 上锁失败
+  HUB_LOCK_STATE_UNLOCKED,       // 已解锁
+  HUB_LOCK_STATE_UNLOCK_FAILED,  // 解锁失败
+} HUB_LOCK_STATE;
+
+typedef enum {
+  LIGHT_COLOR_RED = 1,  // 红色
+  LIGHT_COLOR_GREEN,    // 绿色
+  LIGHT_COLOR_BLUE,     // 蓝色
+  LIGHT_COLOR_WHITE,    // 白色
+  LIGHT_COLOR_ORANGE    // 橙色
+} LightColor;
+
+// 灯的状态
+typedef enum {
+  LIGHT_STATE_OFF = 0,     // 熄灭
+  LIGHT_STATE_ON,          // 常亮
+  LIGHT_STATE_FAST_BLINK,  // 快闪（250ms亮，250ms灭）
+  LIGHT_STATE_SLOW_BLINK   // 慢闪（1500ms亮，1500ms灭）
+} LightState;
+
+// 网络状态
+typedef enum {
+  NETWORK_STATE_UNBIND = 1,       // 未绑定
+  NETWORK_STATE_WIFI_DISCONNECT,  // 路由器断开
+  NETWORK_STATE_WIFI_CONNECTED,   // 路由器连上
+  NETWORK_STATE_SRV_CONNECTED,    // 服务器连上
+} NETWORK_STATE;
+
+typedef enum {
+  LOCK_STATE_FOR_LVGL_NO_LOCK = 0,       // 无锁
+  LOCK_STATE_FOR_LVGL_UNCALIBRATED = 1,  // 锁未校准
+  LOCK_STATE_FOR_LVGL_ABNORMAL = 2,      // 锁异常
+  LOCK_STATE_FOR_LVGL_LOCKED = 3,        // 已上锁
+  LOCK_STATE_FOR_LVGL_UNLOCKED = 4,      // 已解锁
+  LOCK_STATE_FOR_LVGL_DISCONNECT = 5,    // 锁离线
+} LOCK_STATE_FOR_LVGL;
+
+// 设置配网命令
+typedef enum {
+  CONFIGURATION_SET_NETWORK_CMD_START = 3,  // 开始配网
+  CONFIGURATION_SET_NETWORK_CMD_STOP = 4,   // 停止配网
+  CONFIGURATION_SET_NETWORK_CMD_RESET = 5   // 恢复出厂设置
+} CONFIGURATION_SET_NETWORK_CMD;
+
+// 配网状态
+typedef enum {
+  CONFIGURATION_SET_NETWORK_STATE_NONE = 0,       // 未配网
+  CONFIGURATION_SET_NETWORK_STATE_CONN_BLE = 1,   // 连接BLE
+  CONFIGURATION_SET_NETWORK_STATE_CONN_WIFI = 2,  // 连接WIFI
+} CONFIGURATION_SET_NETWORK_STATE;
+
+#endif
