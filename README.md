@@ -1,0 +1,2 @@
+android 使用ndk方式集成mbedtls加密与kcp协议
+使用jni调用，如需要集成更详细的jni的调用，自行添加相关的jni方法
